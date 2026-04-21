@@ -7,11 +7,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
                MatrixMemoryAllocator matrix_memory_allocator) {
   assert(keys.size() == values.size());
 
-  // Persistent accumulators:
-  //   kT_hbm stays in HBM, only moved to SRAM for Q*K^T computation.
-  //   v_sram stays in SRAM (needed during softmax*V via GetRow).
-  Matrix *kT_hbm = nullptr;  // Accumulated K^T in HBM, shape (D, i+1)
-  Matrix *v_sram = nullptr;  // Accumulated V in SRAM, shape (i+1, D)
+  // Persistent: kT in HBM, v in SRAM.
+  Matrix *kT_hbm = nullptr;
+  Matrix *v_sram = nullptr;
 
   const size_t D = 512;
 
@@ -19,8 +17,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     auto current_query = rater.GetNextQuery();
     const size_t Rn = i + 1;
 
-    // ---- 1) Append keys[i] to kT_hbm (stays in HBM) ----
-    // keys[i] is (1, D) in HBM. Transpose in HBM -> (D, 1), then concat.
+    // ---- 1) Append keys[i] to kT_hbm (in HBM) ----
     gpu_sim.Transpose(keys[i], kInGpuHbm);
     {
       Matrix *new_kT = matrix_memory_allocator.Allocate("kT_hbm");
@@ -30,7 +27,6 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         gpu_sim.Concat(kT_hbm, keys[i], new_kT, 1, kInGpuHbm);
         gpu_sim.ReleaseMatrix(kT_hbm);
       }
-      // Release original keys[i] (we've copied or concatenated it).
       gpu_sim.ReleaseMatrix(keys[i]);
       kT_hbm = new_kT;
     }
@@ -51,10 +47,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
 
     // ---- 3) Move Q and kT to SRAM for Q*K^T ----
     gpu_sim.MoveMatrixToSharedMem(current_query);
-    // Bring kT_hbm into SRAM for fast GetRow during matmul split.
     Matrix *kT_sram = matrix_memory_allocator.Allocate("kT_sram");
-    gpu_sim.Copy(kT_hbm, kT_sram, kInGpuHbm);  // first copy in HBM
-    gpu_sim.MoveMatrixToSharedMem(kT_sram);     // then move to SRAM
+    gpu_sim.Copy(kT_hbm, kT_sram, kInGpuHbm);
+    gpu_sim.MoveMatrixToSharedMem(kT_sram);
 
     // ---- 4) Compute QK = Q * K^T via outer-product split (n=1) ----
     Matrix *qk = nullptr;
@@ -78,7 +73,6 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       }
     }
     gpu_sim.ReleaseMatrix(current_query);
-    // Release kT_sram; kT_hbm stays for next round.
     gpu_sim.ReleaseMatrix(kT_sram);
 
     // ---- 5) Row-wise softmax on qk ----
@@ -108,26 +102,52 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     }
     gpu_sim.ReleaseMatrix(exp_qk);
 
-    // ---- 6) Compute attn = softmax * V via outer-product split along Rn.
-    //        For each k in 0..Rn-1: outer = softmax[:,k:k+1] * V[k:k+1,:]
-    //        Sum all outers. Keeps matmul cost low (n=1). ----
+    // ---- 6) Compute attn row-by-row, concatenating rows to build attn.
+    //        For each output row r:
+    //          row_r (1, D) = sum_k softmax[r, k] * V[k, :]
+    //        Then concat row_r to running attn (axis=0). ----
     Matrix *attn = nullptr;
-    for (size_t k = 0; k < Rn; ++k) {
-      Matrix *s_col = matrix_memory_allocator.Allocate("s_col");
-      gpu_sim.GetColumn(softmax, k, s_col, kInSharedMemory);
-      Matrix *v_row = matrix_memory_allocator.Allocate("v_row");
-      gpu_sim.GetRow(v_sram, k, v_row, kInSharedMemory);
-      Matrix *outer = matrix_memory_allocator.Allocate("vouter");
-      gpu_sim.MatMul(s_col, v_row, outer);
-      gpu_sim.ReleaseMatrix(s_col);
-      gpu_sim.ReleaseMatrix(v_row);
+    for (size_t r = 0; r < Rn; ++r) {
+      // Extract softmax row r as (1, Rn)
+      Matrix *sm_row = matrix_memory_allocator.Allocate("sm_row");
+      gpu_sim.GetRow(softmax, r, sm_row, kInSharedMemory);
+
+      // Build row_r by summing scaled V rows.
+      Matrix *row_acc = nullptr;
+      for (size_t k = 0; k < Rn; ++k) {
+        Matrix *scalar = matrix_memory_allocator.Allocate("scalar");
+        gpu_sim.GetColumn(sm_row, k, scalar, kInSharedMemory);  // (1,1)
+        Matrix *v_row = matrix_memory_allocator.Allocate("v_row");
+        gpu_sim.GetRow(v_sram, k, v_row, kInSharedMemory);  // (1, D)
+        Matrix *scaled = matrix_memory_allocator.Allocate("scaled");
+        // MulNum computes scaled = v_row * scalar
+        // But gpu_sim has no MulNum in instruction API... check.
+        // Actually gpu_sim.h doesn't expose MulNum. Use MatMul with a 1x1.
+        // Wait, MatMul(A(1,1), B(1,D)) yields (1, D). Cost = 5*1*1*D = 5D.
+        // That's same as MulNum(4D) roughly.
+        gpu_sim.MatMul(scalar, v_row, scaled);
+        gpu_sim.ReleaseMatrix(scalar);
+        gpu_sim.ReleaseMatrix(v_row);
+        if (row_acc == nullptr) {
+          row_acc = scaled;
+        } else {
+          Matrix *new_row_acc = matrix_memory_allocator.Allocate("row_acc");
+          gpu_sim.MatAdd(row_acc, scaled, new_row_acc);
+          gpu_sim.ReleaseMatrix(row_acc);
+          gpu_sim.ReleaseMatrix(scaled);
+          row_acc = new_row_acc;
+        }
+      }
+      gpu_sim.ReleaseMatrix(sm_row);
+
+      // Concat row_acc into final attn (axis=0).
       if (attn == nullptr) {
-        attn = outer;
+        attn = row_acc;
       } else {
         Matrix *new_attn = matrix_memory_allocator.Allocate("attn");
-        gpu_sim.MatAdd(attn, outer, new_attn);
+        gpu_sim.Concat(attn, row_acc, new_attn, 0, kInSharedMemory);
         gpu_sim.ReleaseMatrix(attn);
-        gpu_sim.ReleaseMatrix(outer);
+        gpu_sim.ReleaseMatrix(row_acc);
         attn = new_attn;
       }
     }
