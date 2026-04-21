@@ -31,34 +31,33 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       kT_hbm = new_kT;
     }
 
-    // ---- 2) Append values[i] to v (stored in HBM between rounds) ----
+    // ---- 2) Append values[i] to v_sram (SRAM) ----
+    gpu_sim.MoveMatrixToSharedMem(values[i]);
     {
-      Matrix *new_v = matrix_memory_allocator.Allocate("v_hbm");
+      Matrix *new_v = matrix_memory_allocator.Allocate("v_sram");
       if (v_sram == nullptr) {
-        gpu_sim.Copy(values[i], new_v, kInGpuHbm);
+        gpu_sim.Copy(values[i], new_v, kInSharedMemory);
       } else {
-        gpu_sim.Concat(v_sram, values[i], new_v, 0, kInGpuHbm);
+        gpu_sim.Concat(v_sram, values[i], new_v, 0, kInSharedMemory);
         gpu_sim.ReleaseMatrix(v_sram);
       }
       gpu_sim.ReleaseMatrix(values[i]);
-      v_sram = new_v;  // Currently in HBM; will be moved to SRAM before use.
+      v_sram = new_v;
     }
 
-    // ---- 3) Q and kT both stay in HBM.  For each k we extract the column
-    //        of Q and the row of kT in HBM, then move both to SRAM for the
-    //        matmul.  This keeps Q*K^T peak SRAM tiny. ----
+    // ---- 3) Move Q and kT to SRAM for Q*K^T ----
+    gpu_sim.MoveMatrixToSharedMem(current_query);
+    Matrix *kT_sram = matrix_memory_allocator.Allocate("kT_sram");
+    gpu_sim.Copy(kT_hbm, kT_sram, kInGpuHbm);
+    gpu_sim.MoveMatrixToSharedMem(kT_sram);
 
     // ---- 4) Compute QK = Q * K^T via outer-product split (n=1) ----
     Matrix *qk = nullptr;
     for (size_t k = 0; k < D; ++k) {
       Matrix *q_col = matrix_memory_allocator.Allocate("q_col");
-      gpu_sim.GetColumn(current_query, k, q_col, kInGpuHbm);
-      gpu_sim.MoveMatrixToSharedMem(q_col);
-
+      gpu_sim.GetColumn(current_query, k, q_col, kInSharedMemory);
       Matrix *k_row = matrix_memory_allocator.Allocate("k_row");
-      gpu_sim.GetRow(kT_hbm, k, k_row, kInGpuHbm);
-      gpu_sim.MoveMatrixToSharedMem(k_row);
-
+      gpu_sim.GetRow(kT_sram, k, k_row, kInSharedMemory);
       Matrix *outer = matrix_memory_allocator.Allocate("outer");
       gpu_sim.MatMul(q_col, k_row, outer);
       gpu_sim.ReleaseMatrix(q_col);
@@ -73,6 +72,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         qk = new_qk;
       }
     }
+    gpu_sim.ReleaseMatrix(current_query);
+    gpu_sim.ReleaseMatrix(kT_sram);
 
     // ---- 5) Row-wise softmax on qk ----
     Matrix *exp_qk = matrix_memory_allocator.Allocate("exp_qk");
@@ -101,39 +102,61 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     }
     gpu_sim.ReleaseMatrix(exp_qk);
 
-    // ---- 6) Compute attn column-by-column.  V stays in HBM; for each
-    //        output column c:
-    //          1) Extract column c of V (in HBM) and move to SRAM.
-    //          2) out_col = softmax * v_col     (Rn x 1) in SRAM.
-    //          3) Move out_col to HBM and concat into running attn_hbm.
-    //        This keeps SRAM peak tiny (just softmax + a few columns). ----
-    Matrix *attn_hbm = nullptr;
-    for (size_t c = 0; c < D; ++c) {
-      Matrix *v_col = matrix_memory_allocator.Allocate("v_col_hbm");
-      gpu_sim.GetColumn(v_sram, c, v_col, kInGpuHbm);
-      gpu_sim.MoveMatrixToSharedMem(v_col);
+    // ---- 6) Compute attn row-by-row, concatenating rows to build attn.
+    //        For each output row r:
+    //          row_r (1, D) = sum_k softmax[r, k] * V[k, :]
+    //        Then concat row_r to running attn (axis=0). ----
+    Matrix *attn = nullptr;
+    for (size_t r = 0; r < Rn; ++r) {
+      // Extract softmax row r as (1, Rn)
+      Matrix *sm_row = matrix_memory_allocator.Allocate("sm_row");
+      gpu_sim.GetRow(softmax, r, sm_row, kInSharedMemory);
 
-      Matrix *out_col = matrix_memory_allocator.Allocate("out_col");
-      gpu_sim.MatMul(softmax, v_col, out_col);
-      gpu_sim.ReleaseMatrix(v_col);
+      // Build row_r by summing scaled V rows.
+      Matrix *row_acc = nullptr;
+      for (size_t k = 0; k < Rn; ++k) {
+        Matrix *scalar = matrix_memory_allocator.Allocate("scalar");
+        gpu_sim.GetColumn(sm_row, k, scalar, kInSharedMemory);  // (1,1)
+        Matrix *v_row = matrix_memory_allocator.Allocate("v_row");
+        gpu_sim.GetRow(v_sram, k, v_row, kInSharedMemory);  // (1, D)
+        Matrix *scaled = matrix_memory_allocator.Allocate("scaled");
+        // MulNum computes scaled = v_row * scalar
+        // But gpu_sim has no MulNum in instruction API... check.
+        // Actually gpu_sim.h doesn't expose MulNum. Use MatMul with a 1x1.
+        // Wait, MatMul(A(1,1), B(1,D)) yields (1, D). Cost = 5*1*1*D = 5D.
+        // That's same as MulNum(4D) roughly.
+        gpu_sim.MatMul(scalar, v_row, scaled);
+        gpu_sim.ReleaseMatrix(scalar);
+        gpu_sim.ReleaseMatrix(v_row);
+        if (row_acc == nullptr) {
+          row_acc = scaled;
+        } else {
+          Matrix *new_row_acc = matrix_memory_allocator.Allocate("row_acc");
+          gpu_sim.MatAdd(row_acc, scaled, new_row_acc);
+          gpu_sim.ReleaseMatrix(row_acc);
+          gpu_sim.ReleaseMatrix(scaled);
+          row_acc = new_row_acc;
+        }
+      }
+      gpu_sim.ReleaseMatrix(sm_row);
 
-      gpu_sim.MoveMatrixToGpuHbm(out_col);
-
-      if (attn_hbm == nullptr) {
-        attn_hbm = out_col;
+      // Concat row_acc into final attn (axis=0).
+      if (attn == nullptr) {
+        attn = row_acc;
       } else {
-        Matrix *new_attn = matrix_memory_allocator.Allocate("attn_hbm");
-        gpu_sim.Concat(attn_hbm, out_col, new_attn, 1, kInGpuHbm);
-        gpu_sim.ReleaseMatrix(attn_hbm);
-        gpu_sim.ReleaseMatrix(out_col);
-        attn_hbm = new_attn;
+        Matrix *new_attn = matrix_memory_allocator.Allocate("attn");
+        gpu_sim.Concat(attn, row_acc, new_attn, 0, kInSharedMemory);
+        gpu_sim.ReleaseMatrix(attn);
+        gpu_sim.ReleaseMatrix(row_acc);
+        attn = new_attn;
       }
     }
     gpu_sim.ReleaseMatrix(softmax);
 
-    // ---- 7) attn is already in HBM; just commit ----
+    // ---- 7) Move attn to HBM and commit ----
+    gpu_sim.MoveMatrixToGpuHbm(attn);
     gpu_sim.Run(false, &matrix_memory_allocator);
-    rater.CommitAnswer(*attn_hbm);
+    rater.CommitAnswer(*attn);
   }
 
   if (kT_hbm != nullptr) gpu_sim.ReleaseMatrix(kT_hbm);
