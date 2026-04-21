@@ -7,39 +7,38 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
                MatrixMemoryAllocator matrix_memory_allocator) {
   assert(keys.size() == values.size());
 
-  // Accumulated K^T (shape 512 x (i+1)) and V (shape (i+1) x 512) in SRAM.
-  Matrix *kT_sram = nullptr;
-  Matrix *v_sram = nullptr;
+  // Persistent accumulators:
+  //   kT_hbm stays in HBM, only moved to SRAM for Q*K^T computation.
+  //   v_sram stays in SRAM (needed during softmax*V via GetRow).
+  Matrix *kT_hbm = nullptr;  // Accumulated K^T in HBM, shape (D, i+1)
+  Matrix *v_sram = nullptr;  // Accumulated V in SRAM, shape (i+1, D)
 
-  const size_t D = 512;  // feature dimension
+  const size_t D = 512;
 
   for (size_t i = 0; i < keys.size(); ++i) {
     auto current_query = rater.GetNextQuery();
-    const size_t Rn = i + 1;  // number of rows in Q
+    const size_t Rn = i + 1;
 
-    // ---- 1) Move current key/value to SRAM and accumulate ----
-    gpu_sim.MoveMatrixToSharedMem(keys[i]);
-    gpu_sim.MoveMatrixToSharedMem(values[i]);
-
-    // Transpose key (1xD) -> (Dx1), in SRAM (cost D)
-    gpu_sim.Transpose(keys[i], kInSharedMemory);
-
-    // Append to kT_sram along axis=1  -> shape (D, Rn)
+    // ---- 1) Append keys[i] to kT_hbm (stays in HBM) ----
+    // keys[i] is (1, D) in HBM. Transpose in HBM -> (D, 1), then concat.
+    gpu_sim.Transpose(keys[i], kInGpuHbm);
     {
-      Matrix *new_kT = matrix_memory_allocator.Allocate("kT");
-      if (kT_sram == nullptr) {
-        gpu_sim.Copy(keys[i], new_kT, kInSharedMemory);
+      Matrix *new_kT = matrix_memory_allocator.Allocate("kT_hbm");
+      if (kT_hbm == nullptr) {
+        gpu_sim.Copy(keys[i], new_kT, kInGpuHbm);
       } else {
-        gpu_sim.Concat(kT_sram, keys[i], new_kT, 1, kInSharedMemory);
-        gpu_sim.ReleaseMatrix(kT_sram);
+        gpu_sim.Concat(kT_hbm, keys[i], new_kT, 1, kInGpuHbm);
+        gpu_sim.ReleaseMatrix(kT_hbm);
       }
+      // Release original keys[i] (we've copied or concatenated it).
       gpu_sim.ReleaseMatrix(keys[i]);
-      kT_sram = new_kT;
+      kT_hbm = new_kT;
     }
 
-    // Append to v_sram along axis=0  -> shape (Rn, D)
+    // ---- 2) Append values[i] to v_sram (SRAM) ----
+    gpu_sim.MoveMatrixToSharedMem(values[i]);
     {
-      Matrix *new_v = matrix_memory_allocator.Allocate("v");
+      Matrix *new_v = matrix_memory_allocator.Allocate("v_sram");
       if (v_sram == nullptr) {
         gpu_sim.Copy(values[i], new_v, kInSharedMemory);
       } else {
@@ -50,13 +49,14 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       v_sram = new_v;
     }
 
-    // ---- 2) Move Q to SRAM ----
+    // ---- 3) Move Q and kT to SRAM for Q*K^T ----
     gpu_sim.MoveMatrixToSharedMem(current_query);
+    // Bring kT_hbm into SRAM for fast GetRow during matmul split.
+    Matrix *kT_sram = matrix_memory_allocator.Allocate("kT_sram");
+    gpu_sim.Copy(kT_hbm, kT_sram, kInGpuHbm);  // first copy in HBM
+    gpu_sim.MoveMatrixToSharedMem(kT_sram);     // then move to SRAM
 
-    // ---- 3) Compute QK = Q * K^T via outer-product split ----
-    // Q is (Rn, D), K^T is (D, Rn). For each k in 0..D-1:
-    //   outer = Q[:,k:k+1] * K^T[k:k+1,:]  which is (Rn x Rn).
-    // Sum all outers to get QK.
+    // ---- 4) Compute QK = Q * K^T via outer-product split (n=1) ----
     Matrix *qk = nullptr;
     for (size_t k = 0; k < D; ++k) {
       Matrix *q_col = matrix_memory_allocator.Allocate("q_col");
@@ -78,8 +78,10 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       }
     }
     gpu_sim.ReleaseMatrix(current_query);
+    // Release kT_sram; kT_hbm stays for next round.
+    gpu_sim.ReleaseMatrix(kT_sram);
 
-    // ---- 4) Row-wise softmax on qk ----
+    // ---- 5) Row-wise softmax on qk ----
     Matrix *exp_qk = matrix_memory_allocator.Allocate("exp_qk");
     gpu_sim.MatExp(qk, exp_qk);
     gpu_sim.ReleaseMatrix(qk);
@@ -106,9 +108,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     }
     gpu_sim.ReleaseMatrix(exp_qk);
 
-    // ---- 5) Compute attn = softmax * V via outer-product split ----
-    // softmax is (Rn, Rn), V is (Rn, D). For each k in 0..Rn-1:
-    //   outer = softmax[:,k:k+1] * V[k:k+1,:]  which is (Rn x D).
+    // ---- 6) Compute attn = softmax * V via outer-product split along Rn.
+    //        For each k in 0..Rn-1: outer = softmax[:,k:k+1] * V[k:k+1,:]
+    //        Sum all outers. Keeps matmul cost low (n=1). ----
     Matrix *attn = nullptr;
     for (size_t k = 0; k < Rn; ++k) {
       Matrix *s_col = matrix_memory_allocator.Allocate("s_col");
@@ -131,13 +133,13 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     }
     gpu_sim.ReleaseMatrix(softmax);
 
-    // ---- 6) Move attn to HBM and commit ----
+    // ---- 7) Move attn to HBM and commit ----
     gpu_sim.MoveMatrixToGpuHbm(attn);
     gpu_sim.Run(false, &matrix_memory_allocator);
     rater.CommitAnswer(*attn);
   }
 
-  if (kT_sram != nullptr) gpu_sim.ReleaseMatrix(kT_sram);
+  if (kT_hbm != nullptr) gpu_sim.ReleaseMatrix(kT_hbm);
   if (v_sram != nullptr) gpu_sim.ReleaseMatrix(v_sram);
   gpu_sim.Run(false, &matrix_memory_allocator);
 }
